@@ -20,7 +20,7 @@ open Telegram → message `@BotFather` → send `/newbot` → follow prompts →
 ## 2. Run locally
 
 ```bash
-cd "telegram notif "
+cd telegram_notif
 python3 -m venv .venv
 source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
