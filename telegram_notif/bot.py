@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import dateparser
+from dateparser.search import search_dates
 from sqlalchemy import (
     create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey, Text
 )
@@ -47,7 +48,7 @@ if not BOT_TOKEN:
     raise SystemExit("Missing BOT_TOKEN env var. Get one from @BotFather.")
 
 # Default timezone for parsing relative dates ("tomorrow evening").
-TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
+TIMEZONE = os.environ.get("TIMEZONE", "Asia/Dubai")
 TZ = ZoneInfo(TIMEZONE)
 
 # Where to keep the SQLite db. On Railway/Render with a persistent disk you
@@ -97,17 +98,36 @@ PENDING: dict[int, dict] = {}
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
 # --------------------------------------------------------------------------- #
+_DATE_SETTINGS = {
+    "TIMEZONE": TIMEZONE,
+    "RETURN_AS_TIMEZONE_AWARE": True,
+    "PREFER_DATES_FROM": "future",
+}
+
+
 def parse_natural_date(text: str):
-    """Parse 'tomorrow 5pm', 'friday morning', 'in 2 days evening', etc."""
-    settings = {
-        "TIMEZONE": TIMEZONE,
-        "RETURN_AS_TIMEZONE_AWARE": True,
-        "PREFER_DATES_FROM": "future",
-    }
-    dt = dateparser.parse(text, settings=settings)
+    """
+    Scan free-form text for a date phrase and return (datetime, matched_text).
+    Returns (None, None) if no date phrase is found.
+
+    Uses dateparser.search.search_dates so messages like
+    "Meeting with my ai trainer at 9pm" yield (9pm-today/tomorrow, "at 9pm").
+    """
+    # search_dates needs an English-only hint to behave well on short input.
+    results = search_dates(text, languages=["en"], settings=_DATE_SETTINGS)
+    if not results:
+        # Fallback: try the whole string (helps with bare "in 2 hours" inputs).
+        dt = dateparser.parse(text, settings=_DATE_SETTINGS)
+        if dt and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt, text if dt else None
+
+    # Prefer the longest matched phrase — usually the most specific one
+    # (e.g. "tomorrow 12pm" beats "tomorrow" alone).
+    matched_text, dt = max(results, key=lambda r: len(r[0]))
     if dt and dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
-    return dt
+    return dt, matched_text
 
 
 def parse_offsets(text: str) -> list:
@@ -210,22 +230,37 @@ def fmt_offsets(offsets) -> str:
     return ", ".join(parts)
 
 
-def clean_title(text: str) -> str:
-    """Strip common date/time phrases out of the task title."""
-    patterns = [
-        r"\b(today|tomorrow|tonight|tmrw)\b",
-        r"\bin \d+ (minutes?|hours?|days?|weeks?)\b",
-        r"\bnext (mon|tue|wed|thu|fri|sat|sun)[a-z]*\b",
-        r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-        r"\b(morning|afternoon|evening|night|noon|midnight)\b",
-        r"\bat \d{1,2}(:\d{2})?\s?(am|pm)?\b",
-        r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b",
-        r"\bon \d{1,2}(st|nd|rd|th)?( of)?\s?[a-z]*\b",
-    ]
+def clean_title(text: str, matched: str | None = None) -> str:
+    """
+    Strip the date phrase from the task title.
+
+    Preferred path: pass `matched` (the substring search_dates pulled out)
+    and we remove just that. If not provided, fall back to regex heuristics.
+    """
     cleaned = text
-    for p in patterns:
-        cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    if matched:
+        # Case-insensitive removal of the matched phrase, plus optional
+        # leading prepositions like "at", "on", "by", "in".
+        import re as _re
+        pat = _re.compile(
+            r"\s*\b(?:at|on|by|in)?\s*" + _re.escape(matched) + r"\b",
+            _re.IGNORECASE,
+        )
+        cleaned = pat.sub("", cleaned, count=1)
+    else:
+        patterns = [
+            r"\b(today|tomorrow|tonight|tmrw)\b",
+            r"\bin \d+ (minutes?|hours?|days?|weeks?)\b",
+            r"\bnext (mon|tue|wed|thu|fri|sat|sun)[a-z]*\b",
+            r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+            r"\b(morning|afternoon|evening|night|noon|midnight)\b",
+            r"\bat \d{1,2}(:\d{2})?\s?(am|pm)?\b",
+            r"\b\d{1,2}(:\d{2})?\s?(am|pm)\b",
+            r"\bon \d{1,2}(st|nd|rd|th)?( of)?\s?[a-z]*\b",
+        ]
+        for p in patterns:
+            cleaned = re.sub(p, "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-:")
     return cleaned or text
 
 
@@ -440,7 +475,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Otherwise treat the message as a new task.
-    dt = parse_natural_date(text)
+    dt, matched = parse_natural_date(text)
     if not dt:
         await update.message.reply_text(
             "I couldn't find a date in that. Try something like "
@@ -456,7 +491,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    title = clean_title(text)
+    title = clean_title(text, matched)
     PENDING[chat_id] = {"awaiting": "schedule", "title": title, "due_at": dt}
     await update.message.reply_text(
         f"\U0001F4CC *{title}*\n"
