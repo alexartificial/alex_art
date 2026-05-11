@@ -88,12 +88,16 @@ class Reminder(Base):
     task = relationship("Task", back_populates="reminders")
 
 
-Base.metadata.create_all(engine)
+class Draft(Base):
+    """A task awaiting its reminder schedule. Persists across bot restarts."""
+    __tablename__ = "drafts"
+    chat_id = Column(Integer, primary_key=True)  # one draft per chat at a time
+    title = Column(Text, nullable=False)
+    due_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(TZ))
 
-# --------------------------------------------------------------------------- #
-# Conversation state (in memory; resets on bot restart)                       #
-# --------------------------------------------------------------------------- #
-PENDING: dict[int, dict] = {}
+
+Base.metadata.create_all(engine)
 
 # --------------------------------------------------------------------------- #
 # Helpers                                                                     #
@@ -105,25 +109,30 @@ _DATE_SETTINGS = {
 }
 
 
+_REMIND_PREFIX = re.compile(
+    r"^\s*(?:please\s+)?remind\s+me\s+(?:to|about|at|on|that|for)?\s*",
+    re.IGNORECASE,
+)
+
+
 def parse_natural_date(text: str):
     """
     Scan free-form text for a date phrase and return (datetime, matched_text).
     Returns (None, None) if no date phrase is found.
-
-    Uses dateparser.search.search_dates so messages like
-    "Meeting with my ai trainer at 9pm" yield (9pm-today/tomorrow, "at 9pm").
     """
-    # search_dates needs an English-only hint to behave well on short input.
-    results = search_dates(text, languages=["en"], settings=_DATE_SETTINGS)
+    # Strip leading "remind me to/about/..." so the parser sees just the content.
+    cleaned = _REMIND_PREFIX.sub("", text, count=1).strip()
+    if not cleaned:
+        cleaned = text
+
+    results = search_dates(cleaned, languages=["en"], settings=_DATE_SETTINGS)
     if not results:
-        # Fallback: try the whole string (helps with bare "in 2 hours" inputs).
-        dt = dateparser.parse(text, settings=_DATE_SETTINGS)
+        dt = dateparser.parse(cleaned, settings=_DATE_SETTINGS)
         if dt and dt.tzinfo is None:
             dt = dt.replace(tzinfo=TZ)
-        return dt, text if dt else None
+        return dt, cleaned if dt else None
 
-    # Prefer the longest matched phrase — usually the most specific one
-    # (e.g. "tomorrow 12pm" beats "tomorrow" alone).
+    # Prefer the longest matched phrase (most specific).
     matched_text, dt = max(results, key=lambda r: len(r[0]))
     if dt and dt.tzinfo is None:
         dt = dt.replace(tzinfo=TZ)
@@ -199,7 +208,7 @@ def parse_offsets(text: str) -> list:
                 _emit(t)
                 i += 1
     if not out:
-        return [1440, 60, 0]
+        return None
     return sorted(out, reverse=True)
 
 
@@ -365,6 +374,7 @@ WELCOME = (
     "hour before, and at the due time).\n\n"
     "Commands:\n"
     "/list — show pending tasks\n"
+    "/cancel — abandon a task you're in the middle of creating\n"
     "/help — this message\n"
     f"\nTimezone: *{TIMEZONE}*"
 )
@@ -376,6 +386,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME, parse_mode="Markdown")
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    s = Session()
+    try:
+        draft = s.get(Draft, chat_id)
+        if draft:
+            s.delete(draft)
+            s.commit()
+            await update.message.reply_text("\U0001F5D1 Pending task cancelled.")
+        else:
+            await update.message.reply_text("Nothing pending to cancel.")
+    finally:
+        s.close()
 
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,18 +488,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main handler: either start a new task or capture reminder schedule."""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
+    lower = text.lower()
 
-    # Awaiting a reminder schedule for a pending task?
-    if chat_id in PENDING and PENDING[chat_id].get("awaiting") == "schedule":
-        offsets = parse_offsets(text)
-        pending = PENDING.pop(chat_id)
-        await create_task_with_schedule(
-            chat_id, pending["title"], pending["due_at"], offsets,
-            update.message.reply_text,
-        )
-        return
+    s = Session()
+    try:
+        draft = s.get(Draft, chat_id)
+        if draft:
+            # If the message looks like a schedule, finalize the draft.
+            if lower in {"default", ""} or parse_offsets(text) is not None:
+                offsets = parse_offsets(text) or [1440, 60, 0]
+                title, due_at = draft.title, draft.due_at
+                s.delete(draft)
+                s.commit()
+                await create_task_with_schedule(
+                    chat_id, title, due_at, offsets, update.message.reply_text,
+                )
+                return
+            # Otherwise: user changed their mind — abandon the draft and continue.
+            s.delete(draft)
+            s.commit()
+    finally:
+        s.close()
 
-    # Otherwise treat the message as a new task.
+    # Treat as a new task.
     dt, matched = parse_natural_date(text)
     if not dt:
         await update.message.reply_text(
@@ -492,7 +528,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     title = clean_title(text, matched)
-    PENDING[chat_id] = {"awaiting": "schedule", "title": title, "due_at": dt}
+
+    # Persist the draft so a redeploy doesn't lose state.
+    s = Session()
+    try:
+        existing = s.get(Draft, chat_id)
+        if existing:
+            s.delete(existing)
+        s.add(Draft(chat_id=chat_id, title=title, due_at=dt))
+        s.commit()
+    finally:
+        s.close()
+
     await update.message.reply_text(
         f"\U0001F4CC *{title}*\n"
         f"Due: {fmt_dt(dt)}\n\n"
@@ -500,7 +547,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • `1d 1h 0` (a day before, an hour before, and at due time)\n"
         "  • `2h, 30m, 0`\n"
         "  • `30m`\n"
-        "Or send `default` for 1d/1h/at-time.",
+        "Or send `default` for 1d/1h/at-time.\n"
+        "Send /cancel to abandon this task.",
         parse_mode="Markdown",
     )
 
@@ -591,6 +639,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("list", list_tasks))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
     application.add_handler(MessageHandler(filters.Regex(r"^/done_\d+"), quick_done))
     application.add_handler(MessageHandler(filters.Regex(r"^/del_\d+"), quick_del))
     application.add_handler(CallbackQueryHandler(on_button))
