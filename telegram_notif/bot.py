@@ -139,16 +139,38 @@ def parse_natural_date(text: str):
     return dt, matched_text
 
 
+_ENGLISH_NUMS = {
+    "a": "1", "an": "1", "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "fifteen": "15",
+    "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50", "sixty": "60",
+}
+_ENGLISH_NUM_PAT = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _ENGLISH_NUMS) + r")\b", re.IGNORECASE
+)
+
+
+def _normalize_offset_text(text: str) -> str:
+    """Pre-process schedule input: turn 'an hour' -> '1 hour', etc."""
+    text = text.lower().strip()
+    # Strip flavor words that don't change meaning.
+    text = re.sub(r"\b(before|prior|ahead|ago|earlier|in advance)\b", "", text)
+    # Common phrases.
+    text = re.sub(r"\bhalf\s+an?\s+hour\b", "30 minutes", text)
+    text = re.sub(r"\bquarter\s+(?:of\s+)?an?\s+hour\b", "15 minutes", text)
+    # Word-to-digit substitution.
+    text = _ENGLISH_NUM_PAT.sub(lambda m: _ENGLISH_NUMS[m.group(0).lower()], text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def parse_offsets(text: str) -> list:
     """
     Parse a reminder schedule into a sorted list of minutes-before-due.
 
-    Each entry can be space-separated tokens like ``1d 1h 0`` (-> three offsets:
-    1440, 60, 0), or unit-mixed like ``2h30m`` (-> single 150-min offset).
-    Comma, slash, or " and " separates entries. ``0``/``now``/``at time``
-    means "fire exactly at the due time".
+    Returns None if nothing parseable was found, [1440, 60, 0] for
+    "default"/empty, or a sorted-descending list of minutes otherwise.
     """
-    text = text.lower().strip()
+    text = _normalize_offset_text(text)
     if not text or text == "default":
         return [1440, 60, 0]
 
@@ -491,12 +513,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lower = text.lower()
 
     s = Session()
+    abandon_draft = False
     try:
         draft = s.get(Draft, chat_id)
         if draft:
-            # If the message looks like a schedule, finalize the draft.
-            if lower in {"default", ""} or parse_offsets(text) is not None:
-                offsets = parse_offsets(text) or [1440, 60, 0]
+            # First try: does this look like a schedule reply?
+            offsets = parse_offsets(text)
+            if offsets is not None:
                 title, due_at = draft.title, draft.due_at
                 s.delete(draft)
                 s.commit()
@@ -504,7 +527,26 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id, title, due_at, offsets, update.message.reply_text,
                 )
                 return
-            # Otherwise: user changed their mind — abandon the draft and continue.
+
+            # Second try: is it clearly a brand-new task with a future date?
+            new_dt, _ = parse_natural_date(text)
+            if new_dt and new_dt > datetime.now(TZ):
+                abandon_draft = True  # fall through and let new-task code run
+            else:
+                # Ambiguous — keep the draft and re-prompt the user.
+                await update.message.reply_text(
+                    "I didn't recognize that as a reminder schedule.\n\n"
+                    "Try things like:\n"
+                    "  • `1d 1h 0`\n"
+                    "  • `30m`\n"
+                    "  • `an hour before`\n"
+                    "  • `default`\n\n"
+                    f"Pending task: *{draft.title}* due {fmt_dt(draft.due_at)}\n"
+                    "Send /cancel to abandon it.",
+                    parse_mode="Markdown",
+                )
+                return
+        if abandon_draft and draft:
             s.delete(draft)
             s.commit()
     finally:
