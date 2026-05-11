@@ -238,6 +238,15 @@ def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(TZ).strftime("%a %d %b, %I:%M %p")
 
 
+def _aware(dt):
+    """Ensure a datetime is timezone-aware. SQLite strips tzinfo on round-trip."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=TZ)
+    return dt
+
+
 def fmt_offsets(offsets) -> str:
     parts = []
     for m in offsets:
@@ -314,7 +323,7 @@ async def fire_reminder(task_id: int, reminder_id: int):
             return
 
         now = datetime.now(TZ)
-        delta = task.due_at - now
+        delta = _aware(task.due_at) - now
         if delta.total_seconds() > 0:
             mins_left = int(delta.total_seconds() // 60)
             if mins_left >= 1440:
@@ -334,7 +343,7 @@ async def fire_reminder(task_id: int, reminder_id: int):
         text = (
             f"{header}\n\n"
             f"\U0001F4CC *{task.title}*\n"
-            f"Due: {fmt_dt(task.due_at)}"
+            f"Due: {fmt_dt(_aware(task.due_at))}"
         )
         kb = InlineKeyboardMarkup([
             [
@@ -354,7 +363,7 @@ async def fire_reminder(task_id: int, reminder_id: int):
         # If this was the last scheduled reminder and the task is past due
         # without confirmation, queue another nag in 30 min.
         all_sent = all(r.sent for r in task.reminders)
-        if all_sent and not task.done and now >= task.due_at:
+        if all_sent and not task.done and now >= _aware(task.due_at):
             schedule_followup(task.id, minutes=30)
     finally:
         s.close()
@@ -441,7 +450,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for t in tasks:
             offsets = [int(x) for x in t.reminder_offsets.split(",") if x]
             lines.append(
-                f"• *{t.title}*\n  Due: {fmt_dt(t.due_at)}\n  "
+                f"• *{t.title}*\n  Due: {fmt_dt(_aware(t.due_at))}\n  "
                 f"Reminders: {fmt_offsets(offsets)}\n  /done\\_{t.id}  /del\\_{t.id}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
@@ -520,7 +529,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # First try: does this look like a schedule reply?
             offsets = parse_offsets(text)
             if offsets is not None:
-                title, due_at = draft.title, draft.due_at
+                title, due_at = draft.title, _aware(draft.due_at)
                 s.delete(draft)
                 s.commit()
                 await create_task_with_schedule(
@@ -541,7 +550,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "  • `30m`\n"
                     "  • `an hour before`\n"
                     "  • `default`\n\n"
-                    f"Pending task: *{draft.title}* due {fmt_dt(draft.due_at)}\n"
+                    f"Pending task: *{draft.title}* due {fmt_dt(_aware(draft.due_at))}\n"
                     "Send /cancel to abandon it.",
                     parse_mode="Markdown",
                 )
@@ -610,6 +619,7 @@ async def create_task_with_schedule(
         s.flush()
 
         now = datetime.now(TZ)
+        due_at = _aware(due_at)
         scheduled = []
         for off in offsets:
             fire_at = due_at - timedelta(minutes=off)
@@ -676,8 +686,22 @@ async def post_init(app: Application):
     logger.info("Scheduler started. Timezone=%s", TIMEZONE)
 
 
+async def on_error(update, context):
+    logger.exception("Handler error", exc_info=context.error)
+    try:
+        if update and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Something went wrong handling that. "
+                     "I've logged it. You can try again, or /cancel and start over.",
+            )
+    except Exception:
+        pass
+
+
 def main():
     application.post_init = post_init
+    application.add_error_handler(on_error)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
     application.add_handler(CommandHandler("list", list_tasks))
