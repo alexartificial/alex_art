@@ -60,7 +60,18 @@ DB_URL = f"sqlite:///{DB_PATH}"
 # Database models                                                             #
 # --------------------------------------------------------------------------- #
 Base = declarative_base()
-engine = create_engine(DB_URL, future=True)
+engine = create_engine(DB_URL, future=True, connect_args={"check_same_thread": False})
+
+# Enable WAL mode for friendlier concurrent reads/writes (SQLite only).
+if DB_URL.startswith("sqlite"):
+    from sqlalchemy import event as _sa_event
+
+    @_sa_event.listens_for(engine, "connect")
+    def _set_sqlite_wal(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
 Session = sessionmaker(bind=engine, future=True)
 
 
@@ -277,6 +288,8 @@ def clean_title(text: str, matched: str | None = None) -> str:
     Preferred path: pass `matched` (the substring search_dates pulled out)
     and we remove just that. If not provided, fall back to regex heuristics.
     """
+    # Strip any leading "remind me to/about/..." prefix first.
+    text = _REMIND_PREFIX.sub("", text, count=1).strip() or text
     cleaned = text
     if matched:
         # Case-insensitive removal of the matched phrase, plus optional
@@ -530,11 +543,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             offsets = parse_offsets(text)
             if offsets is not None:
                 title, due_at = draft.title, _aware(draft.due_at)
-                s.delete(draft)
-                s.commit()
+                # Close session BEFORE async scheduling so draft row isn't
+                # held under a transaction lock during APScheduler writes.
+                s.close()
                 await create_task_with_schedule(
                     chat_id, title, due_at, offsets, update.message.reply_text,
                 )
+                # Only delete draft AFTER successful creation.
+                s = Session()
+                try:
+                    d = s.get(Draft, chat_id)
+                    if d:
+                        s.delete(d)
+                        s.commit()
+                finally:
+                    s.close()
                 return
 
             # Second try: is it clearly a brand-new task with a future date?
@@ -607,6 +630,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def create_task_with_schedule(
     chat_id: int, title: str, due_at: datetime, offsets: list, reply
 ):
+    """Persist task + reminders, commit SQL, THEN queue APScheduler jobs.
+
+    Order matters: SQLite locks the whole DB on write. Holding our session
+    while APScheduler tries to write to apscheduler_jobs in the same file
+    can deadlock. Commit first, schedule second.
+    """
+    due_at = _aware(due_at)
+    now = datetime.now(TZ)
+
+    # Phase 1: persist task + reminders.
+    pending_jobs = []
     s = Session()
     try:
         task = Task(
@@ -617,10 +651,6 @@ async def create_task_with_schedule(
         )
         s.add(task)
         s.flush()
-
-        now = datetime.now(TZ)
-        due_at = _aware(due_at)
-        scheduled = []
         for off in offsets:
             fire_at = due_at - timedelta(minutes=off)
             if fire_at <= now:
@@ -628,32 +658,38 @@ async def create_task_with_schedule(
             r = Reminder(task_id=task.id, fire_at=fire_at)
             s.add(r)
             s.flush()
-            scheduler.add_job(
-                fire_reminder,
-                "date",
-                run_date=fire_at,
-                args=[task.id, r.id],
-                id=f"r{r.id}",
-                replace_existing=True,
-            )
-            scheduled.append(fire_at)
+            pending_jobs.append((task.id, r.id, fire_at))
         s.commit()
-
-        if scheduled:
-            sched_str = ", ".join(fmt_dt(d) for d in scheduled)
-            await reply(
-                f"✅ Saved *{title}* due {fmt_dt(due_at)}.\n"
-                f"Reminders set for: {sched_str}",
-                parse_mode="Markdown",
-            )
-        else:
-            await reply(
-                "⚠️ Saved but all reminder times are already in the past. "
-                "Send `/list` and tap Snooze to reschedule.",
-                parse_mode="Markdown",
-            )
     finally:
         s.close()
+
+    # Phase 2: schedule jobs outside the SQL transaction.
+    scheduled = []
+    for task_id, reminder_id, fire_at in pending_jobs:
+        scheduler.add_job(
+            fire_reminder,
+            "date",
+            run_date=fire_at,
+            args=[task_id, reminder_id],
+            id=f"r{reminder_id}",
+            replace_existing=True,
+        )
+        scheduled.append(fire_at)
+
+    # Phase 3: confirm to user.
+    if scheduled:
+        sched_str = ", ".join(fmt_dt(d) for d in scheduled)
+        await reply(
+            f"✅ Saved *{title}* due {fmt_dt(due_at)}.\n"
+            f"Reminders set for: {sched_str}",
+            parse_mode="Markdown",
+        )
+    else:
+        await reply(
+            "⚠️ Saved but all reminder times are already in the past. "
+            "Send `/list` and tap Snooze to reschedule.",
+            parse_mode="Markdown",
+        )
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
